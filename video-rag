@@ -1,0 +1,240 @@
+
+import os
+import torch
+import whisper
+import cv2
+import numpy as np
+import gradio as gr
+import chromadb
+import requests
+from ollama import chat
+from chromadb import PersistentClient
+from langchain_core.prompts import PromptTemplate
+from moviepy.editor import VideoFileClip
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+from sentence_transformers import SentenceTransformer
+from transformers import BlipProcessor, BlipForConditionalGeneration
+from pydub import AudioSegment  # For saving audio
+
+# === Setup ===
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Using device: {device}")
+
+# === Load models globally ===
+whisper_model = whisper.load_model("base")
+caption_processor = BlipProcessor.from_pretrained("./blip_offline_model", local_files_only=True)
+caption_model = BlipForConditionalGeneration.from_pretrained("./blip_offline_model", local_files_only=True).to(device)
+embedder = SentenceTransformer("./sentence_transformer_local", device=device)
+
+
+# === Zephyr API wrapper ===
+'''def run_zephyr_offline(prompt_text):
+    response = requests.post(
+        "http://localhost:11434/api/chat",
+
+        json={
+            "model": "zephyr",
+            "messages": [
+                {"role": "user", "content": prompt_text}
+            ]
+        }
+    )
+    return response.json()['message']['content']'''
+
+# === Mistral API wrapper ===
+def run_mistral_offline(prompt_text):
+    response = chat(
+        model="mistral",
+        messages=[
+            {"role": "user", "content": prompt_text}
+        ]
+    )
+    return response['message']['content']
+
+# === Step 1: Extract audio ===
+def extract_audio(video_path, audio_output="audio.wav"):
+
+    video = VideoFileClip(video_path)
+
+    if video.audio is None:
+        return None, None
+
+
+    video.audio.write_audiofile(audio_output, verbose=False, logger=None)
+
+    # Optional: Convert to mp3 for download
+
+    try:
+        audio = AudioSegment.from_wav(audio_output)
+        mp3_output = audio_output.replace(".wav", ".mp3")
+        audio.export(mp3_output, format="mp3")
+
+        return audio_output, mp3_output
+    except Exception as e:
+        print(f"Error converting audio: {e}")
+        return audio_output, None
+    
+
+
+
+
+# === Step 2: Transcribe audio ===
+def transcribe_audio(audio_path):
+    result = whisper_model.transcribe(audio_path)
+    return result['text']
+
+# === Step 3: Extract and caption key frames ===
+def extract_key_frames(video_path, frame_interval= 3):
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_step = int(fps * frame_interval)
+    frame_count = 0
+    frames = []
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if frame_count % frame_step == 0:
+            frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        frame_count += 1
+    cap.release()
+    return frames
+
+def caption_frames(frames):
+    captions = []
+    for img in frames:
+        inputs = caption_processor(images=img, return_tensors="pt").to(device)
+        out = caption_model.generate(**inputs)
+        caption = caption_processor.decode(out[0], skip_special_tokens=True)
+        if caption not in captions:
+            captions.append(caption)
+    return captions
+
+# === Step 4: Setup ChromaDB ===
+def setup_chroma_store(text_chunks, collection_name="video_rag_chunks"):
+    client = PersistentClient(path="./chroma_storage")
+    if collection_name in [c.name for c in client.list_collections()]:
+        client.delete_collection(name=collection_name)
+    collection = client.create_collection(name=collection_name)
+    embeddings = embedder.encode(text_chunks).tolist()
+    collection.add(documents=text_chunks, embeddings=embeddings, ids=[f"chunk_{i}" for i in range(len(text_chunks))])
+    return collection
+
+# === Step 5: Answer Query ===
+prompt_template = PromptTemplate(
+    template="""
+You are a highly knowledgeable and intelligent assistant integrated into a Video-RAG (Retrieval-Augmented Generation) system designed to analyze video content related to maritime topics, including merchant ships, naval vessels, cargo operations, maritime engineering, and shipping logistics.
+
+Using the context provided—which may include extracted metadata (e.g., file name, duration, resolution), image captions (from frames), and speech transcripts (from the video's audio)—your task is to generate a comprehensive and informative response to the user's question.
+
+Please analyze the context carefully and craft a well-organized, long-form answer  in clear, professional, paragraph-style English. Your response should prioritize clarity, factual accuracy, and completeness.
+
+Specifically:
+
+- **If the question asks for video details**, include all relevant information such as:
+  - Video file format (e.g., MP4, MKV, AVI)
+  - File size (in MB or GB)
+  - Video resolution, frame rate, and duration, if available
+
+- **If the context refers to ships**, describe:
+  - The type of ship (e.g., container ship, tanker, warship, cargo vessel)
+  - Its apparent function or mission based on visual or spoken cues
+  - Any observable features (e.g., size, deck layout, cranes, radars, naval markings, hull number)
+  - Crew activity, operations, and notable equipment
+  - Geographic or environmental context (e.g., port, sea, harbor, combat zone)
+  - Any notable events or maritime actions mentioned in the transcript or captions
+
+If specific information such as file format or ship type is missing or ambiguous in the context, acknowledge this and explain clearly what is available and what is not. Use technical terms where appropriate and maintain a formal, objective tone throughout the response.
+
+Your goal is to make the user feel fully informed, even if some information must be inferred or described with caution due to limited context.
+
+---
+
+Context:
+{context}
+
+User Question:
+{question}
+
+Answer:
+
+    """,
+    input_variables=["context", "question"]
+)
+
+def answer_query(query, collection, k=7):
+    query_embed = embedder.encode([query])[0].tolist()
+    results = collection.query(query_embeddings=[query_embed], n_results=k)
+    context = "\n".join(results['documents'][0])
+    final_prompt = prompt_template.format(context=context, question=query)
+    return run_mistral_offline(final_prompt)
+
+# === Globals ===
+video_transcript = ""
+video_captions = []
+chroma_collection = None
+extracted_mp3_path = ""
+
+# === Gradio Interface ===
+def process_video(video):
+    global video_transcript, video_captions, chroma_collection, extracted_mp3_path
+    audio_path, mp3_path = extract_audio(video)
+    video_transcript = ""
+    video_captions = []
+    if audio_path is None:
+        video_transcript = "No audio found in video."
+        extracted_mp3_path = None
+
+    else:
+        extracted_mp3_path = mp3_path
+        video_transcript = transcribe_audio(audio_path)
+
+    frames = extract_key_frames(video)
+    video_captions = caption_frames(frames)
+    
+
+    chunks = []
+    '''video_transcript = transcribe_audio(audio_path)
+    frames = extract_key_frames(video)
+    video_captions = caption_frames(frames)
+    chunks = [s.strip() for s in video_transcript.split(".") if s.strip()] + video_captions
+    chroma_collection = setup_chroma_store(chunks)
+    return f"Processed! Transcript length: {len(video_transcript)} chars. Captions: {len(video_captions)}", mp3_path'''
+
+    if video_transcript and video_transcript != "No audio found in video.":
+        chunks += [s.strip() for s in video_transcript.split(".") if s.strip()]
+    if video_captions:
+        chunks += video_captions
+
+    if not chunks:
+        return "No transcript or visual captions found in video.", None
+
+    chroma_collection = setup_chroma_store(chunks)
+
+    return (
+        f"Processed! Transcript length: {len(video_transcript)} chars. Captions: {len(video_captions)}",
+        mp3_path if mp3_path else None
+    )
+
+def chat_with_video(query):
+    if not chroma_collection:
+        return "Please upload and process a video first."
+    return answer_query(query, chroma_collection)
+
+# === Gradio UI ===
+with gr.Blocks() as demo:
+    gr.Markdown("""# 🎥 Video RAG Chatbot\nUpload a video, then ask questions based on its audio and visuals.""")
+    with gr.Row():
+        video_input = gr.Video(label="Upload Video")
+        process_btn = gr.Button("Process Video")
+    status_output = gr.Textbox(label="Status")
+    audio_output = gr.Audio(label="Extracted Audio (MP3)", interactive=False, visible=True)
+    with gr.Row():
+        query_input = gr.Textbox(label="Ask a question about the video")
+        query_output = gr.Textbox(label="Answer")
+    process_btn.click(process_video, inputs=video_input, outputs=[status_output, audio_output])
+    query_input.submit(chat_with_video, inputs=query_input, outputs=query_output)
+
+if __name__ == "__main__":
+    demo.launch()
